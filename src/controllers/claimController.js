@@ -72,6 +72,15 @@ exports.submitClaim = async (req, res, next) => {
     if (claim.status !== "draft") {
       return res.status(400).json({ message: "Only draft claims can be submitted" });
     }
+    // Enforce allowed claim limit when submitting
+    try {
+      const allowedLimit = await Config.getEffectiveClaimLimit(req.user);
+      if (claim.amount > allowedLimit) {
+        return res.status(400).json({ message: `Claim amount exceeds allowed limit (${allowedLimit})` });
+      }
+    } catch (e) {
+      return res.status(500).json({ message: "Unable to determine claim limit", detail: e.message });
+    }
     claim.transitionTo("submitted");
     await claim.save();
     return res.json({ claim });

@@ -12,6 +12,8 @@ connectDB();
 app.get('/', (_req, res) => res.json({ status: 'ok' }));
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/claims', require('./routes/claimRoutes'));
+app.use('/api/users', require('./routes/userRoutes'));
+app.use('/api/config', require('./routes/configRoutes'));
 app.use(notFound);
 app.use(errorHandler);
 
