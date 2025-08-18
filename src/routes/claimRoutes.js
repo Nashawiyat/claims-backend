@@ -32,7 +32,7 @@ const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024
 // Employee create draft claim
 router.post("/", protect, authorize("employee"), upload.single("receipt"), claimController.createClaim);
 
-// Employee list own claims
+// Employee list own claims (with optional pagination)
 router.get("/mine", protect, authorize("employee"), claimController.listMyClaims);
 
 // Employee submit draft claim
@@ -46,7 +46,7 @@ router.get("/manager", protect, authorize("manager"), claimController.listSubmit
 
 // Finance reimburse
 router.put("/:id/reimburse", protect, authorize("finance"), claimController.reimburseClaim);
-// Finance list approved/reimbursed
+router.put("/:id/reject-finance", protect, authorize("finance"), claimController.financeRejectClaim);
 router.get("/finance", protect, authorize("finance"), claimController.listForFinance);
 
 module.exports = router;

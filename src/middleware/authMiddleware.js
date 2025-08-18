@@ -51,7 +51,9 @@ exports.authorize = (...roles) => {
     if (!req.user) {
       return res.status(500).json({ message: "User context missing before authorization" });
     }
-    if (!allowed.has(req.user.role)) {
+  // Admin bypass: admin can do everything
+  if (req.user.role === 'admin') return next();
+  if (!allowed.has(req.user.role)) {
       return res.status(403).json({ message: "Forbidden: insufficient role", currentRole: req.user.role });
     }
     next();

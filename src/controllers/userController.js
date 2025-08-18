@@ -5,6 +5,7 @@
  */
 
 const { User } = require("../models");
+const AppError = require('../utils/AppError');
 
 // PATCH /api/users/:id/limit  (admin, finance)
 // Body: { claimLimit: <number|null> }
@@ -12,21 +13,40 @@ exports.updateClaimLimit = async (req, res, next) => {
   try {
     const { id } = req.params;
     let { claimLimit } = req.body;
-    if (claimLimit === undefined) {
-      return res.status(400).json({ message: "claimLimit is required (number or null)" });
-    }
+  if (claimLimit === undefined) throw AppError.badRequest('claimLimit is required', 'CLAIM_LIMIT_REQUIRED');
     if (claimLimit === null || claimLimit === "null") {
       claimLimit = null; // explicit reset to use global default
     } else {
       const numeric = Number(claimLimit);
       if (!Number.isFinite(numeric) || numeric < 0) {
-        return res.status(400).json({ message: "claimLimit must be a non-negative number or null" });
+        throw AppError.badRequest('claimLimit must be a non-negative number or null', 'CLAIM_LIMIT_INVALID');
       }
       claimLimit = numeric;
     }
     const user = await User.findById(id);
-    if (!user) return res.status(404).json({ message: "User not found" });
+  if (!user) throw AppError.notFound('User not found');
     user.claimLimit = claimLimit;
+    await user.save();
+    return res.json({ user: user.toJSON() });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// PATCH /api/users/:id/manager (admin only)
+// Body: { managerId: ObjectId | null }
+exports.updateManager = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    let { managerId } = req.body;
+    const user = await User.findById(id);
+  if (!user) throw AppError.notFound('User not found');
+  if (user.role !== 'employee') throw AppError.badRequest('Only employees have managers','NOT_EMPLOYEE');
+  if (managerId === null || managerId === 'null') throw AppError.badRequest('Employee must have a manager','MANAGER_REQUIRED');
+  if (!managerId) throw AppError.badRequest('managerId required','MANAGER_ID_REQUIRED');
+    const manager = await User.findById(managerId);
+  if (!manager || manager.role !== 'manager') throw AppError.badRequest('managerId must reference a manager user','MANAGER_INVALID');
+    user.manager = manager._id;
     await user.save();
     return res.json({ user: user.toJSON() });
   } catch (err) {

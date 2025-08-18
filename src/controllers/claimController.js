@@ -8,6 +8,16 @@ const path = require("path");
 const fs = require("fs");
 const { Claim, Config } = require("../models");
 
+// Helper: ensure a manager is the direct manager of the claim's employee
+async function ensureManagerOf(claim, managerId) {
+  if (!claim.populated('user')) {
+    await claim.populate('user', 'manager');
+  }
+  const user = claim.user;
+  if (!user) return false;
+  return !!(user.manager && user.manager.toString() === managerId.toString());
+}
+
 // Ensure uploads directory exists (defensive)
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
@@ -29,6 +39,7 @@ exports.createClaim = async (req, res, next) => {
 
     const claim = await Claim.create({
       user: req.user._id,
+  manager: req.user.manager || null,
       title,
       description,
       amount: numericAmount,
@@ -54,8 +65,15 @@ exports.createClaim = async (req, res, next) => {
 // List current user's claims (employee scope)
 exports.listMyClaims = async (req, res, next) => {
   try {
-    const claims = await Claim.find({ user: req.user._id }).sort({ createdAt: -1 });
-    return res.json({ claims });
+    const { page = 1, limit = 20 } = req.query;
+    const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+    const query = { user: req.user._id };
+    const [items, total] = await Promise.all([
+      Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),
+      Claim.countDocuments(query)
+    ]);
+    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items });
   } catch (err) {
     return next(err);
   }
@@ -89,13 +107,17 @@ exports.submitClaim = async (req, res, next) => {
   }
 };
 
-// Approve claim (manager)
+// Approve claim (manager or admin)
 exports.approveClaim = async (req, res, next) => {
   try {
     const claim = await Claim.findById(req.params.id);
     if (!claim) return res.status(404).json({ message: "Claim not found" });
     if (claim.status !== "submitted") {
       return res.status(400).json({ message: "Only submitted claims can be approved" });
+    }
+    if (req.user.role === 'manager') {
+      const ok = await ensureManagerOf(claim, req.user._id);
+      if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
     }
     claim.transitionTo("approved");
     claim.managerReviewer = req.user._id;
@@ -114,6 +136,10 @@ exports.rejectClaim = async (req, res, next) => {
     if (!claim) return res.status(404).json({ message: "Claim not found" });
     if (claim.status !== "submitted") {
       return res.status(400).json({ message: "Only submitted claims can be rejected" });
+    }
+    if (req.user.role === 'manager') {
+      const ok = await ensureManagerOf(claim, req.user._id);
+      if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
     }
     claim.transitionTo("rejected");
     claim.managerReviewer = req.user._id;
@@ -142,22 +168,35 @@ exports.reimburseClaim = async (req, res, next) => {
   }
 };
 
+// Finance reject after approval (finance or admin)
+exports.financeRejectClaim = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const claim = await Claim.findById(req.params.id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+    if (claim.status !== 'approved') {
+      return res.status(400).json({ message: 'Only approved claims can be rejected by finance' });
+    }
+    claim.transitionTo('rejected');
+    claim.financeReviewer = req.user._id;
+    claim.rejectionReason = reason || '';
+    await claim.save();
+    return res.json({ claim });
+  } catch (err) {
+    return next(err);
+  }
+};
+
 // Manager list submitted claims (filter + pagination)
 exports.listSubmitted = async (req, res, next) => {
   try {
     const { page = 1, limit = 10, status } = req.query;
     const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
     const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
-    const query = { };
-    // Manager sees only submitted (optional status filter for approved/rejected?)
-    const allowedStatuses = ["submitted", "approved", "rejected"]; // workflow subset relevant to manager
-    if (status) {
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({ message: "Invalid status filter" });
-      }
-      query.status = status;
-    } else {
-      query.status = "submitted";
+    const allowedStatuses = ["submitted", "approved", "rejected"]; 
+    const query = { status: status && allowedStatuses.includes(status) ? status : 'submitted' };
+    if (req.user.role === 'manager') {
+      query.manager = req.user._id; // use snapshot index
     }
     const [items, total] = await Promise.all([
       Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),

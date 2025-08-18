@@ -32,18 +32,9 @@ const UserSchema = new mongoose.Schema(
       index: true,
     },
     manager: {
-      // For employees: their approving manager (optional for other roles)
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      validate: {
-        validator: function (v) {
-          if (this.role === "employee") {
-            return !!v; // must exist
-          }
-          return true;
-        },
-        message: "Employee must have a manager assigned",
-      },
+      required: function () { return this.role === 'employee'; },
     },
     claimLimit: {
       // Personal override; if null, derive from config or role defaults

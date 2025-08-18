@@ -27,7 +27,13 @@ async function registerAndLogin(user) {
 
 test('claim submission enforces global default limit and user override', async () => {
   const adminToken = await registerAndLogin({ name: 'Admin', email: 'admin@example.com', password: 'Secret123', role: 'admin' });
-  const employeeToken = await registerAndLogin({ name: 'Emp', email: 'emp.limit@example.com', password: 'Secret123', role: 'employee' });
+  // Need a manager for the employee
+  await request(app).post('/api/auth/register').send({ name: 'MgrL', email: 'mgr.limit@example.com', password: 'Secret123', role: 'manager' });
+  const mgrLogin = await request(app).post('/api/auth/login').send({ email: 'mgr.limit@example.com', password: 'Secret123' });
+  const managerId = mgrLogin.body.user._id;
+  await request(app).post('/api/auth/register').send({ name: 'Emp', email: 'emp.limit@example.com', password: 'Secret123', role: 'employee', manager: managerId });
+  const employeeTokenRes = await request(app).post('/api/auth/login').send({ email: 'emp.limit@example.com', password: 'Secret123' });
+  const employeeToken = employeeTokenRes.body.token;
 
   // Lower global limit to 100
   const cfgRes = await request(app)

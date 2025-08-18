@@ -6,5 +6,6 @@ const userController = require("../controllers/userController");
 
 // Adjust a user's claim limit (admin & finance)
 router.patch("/:id/limit", protect, authorize("admin", "finance"), userController.updateClaimLimit);
+router.patch("/:id/manager", protect, authorize("admin"), userController.updateManager);
 
 module.exports = router;

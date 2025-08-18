@@ -25,10 +25,20 @@ async function registerAndLogin(user) {
   return res.body.token;
 }
 
+async function createEmployeeWithManager(empName, empEmail, managerId) {
+  await request(app).post('/api/auth/register').send({ name: empName, email: empEmail, password: 'Secret123', role: 'employee', manager: managerId });
+  const res = await request(app).post('/api/auth/login').send({ email: empEmail, password: 'Secret123' });
+  return res.body.token;
+}
+
 test('employee draft -> submit -> manager approve -> finance reimburse', async () => {
-  const managerToken = await registerAndLogin({ name: 'Mgr', email: 'mgr@example.com', password: 'Secret123', role: 'manager' });
+  // Create manager and finance first
+  await request(app).post('/api/auth/register').send({ name: 'Mgr', email: 'mgr@example.com', password: 'Secret123', role: 'manager' });
+  const managerLogin = await request(app).post('/api/auth/login').send({ email: 'mgr@example.com', password: 'Secret123' });
+  const managerToken = managerLogin.body.token;
+  const managerId = managerLogin.body.user._id;
   const financeToken = await registerAndLogin({ name: 'Fin', email: 'fin@example.com', password: 'Secret123', role: 'finance' });
-  const employeeToken = await registerAndLogin({ name: 'Emp', email: 'emp@example.com', password: 'Secret123', role: 'employee' });
+  const employeeToken = await createEmployeeWithManager('Emp','emp@example.com', managerId);
 
   // Create draft (mock receipt upload via attach)
   const draftRes = await request(app)
@@ -63,9 +73,11 @@ test('employee draft -> submit -> manager approve -> finance reimburse', async (
 });
 
 test('draft -> submit -> manager reject path; finance cannot reimburse rejected; manager cannot approve twice', async () => {
-  const managerToken = await registerAndLogin({ name: 'Mgr2', email: 'mgr2@example.com', password: 'Secret123', role: 'manager' });
+  await request(app).post('/api/auth/register').send({ name: 'Mgr2', email: 'mgr2@example.com', password: 'Secret123', role: 'manager' });
+  const mgrLogin = await request(app).post('/api/auth/login').send({ email: 'mgr2@example.com', password: 'Secret123' });
+  const managerToken = mgrLogin.body.token; const managerId = mgrLogin.body.user._id;
   const financeToken = await registerAndLogin({ name: 'Fin2', email: 'fin2@example.com', password: 'Secret123', role: 'finance' });
-  const employeeToken = await registerAndLogin({ name: 'Emp2', email: 'emp2@example.com', password: 'Secret123', role: 'employee' });
+  const employeeToken = await createEmployeeWithManager('Emp2','emp2@example.com', managerId);
 
   // Create draft
   const draftRes = await request(app)
@@ -106,9 +118,11 @@ test('draft -> submit -> manager reject path; finance cannot reimburse rejected;
 });
 
 test('forbidden and invalid transitions: employee cannot approve; cannot approve draft; cannot reimburse submitted', async () => {
-  const managerToken = await registerAndLogin({ name: 'Mgr3', email: 'mgr3@example.com', password: 'Secret123', role: 'manager' });
+  await request(app).post('/api/auth/register').send({ name: 'Mgr3', email: 'mgr3@example.com', password: 'Secret123', role: 'manager' });
+  const mgrLogin = await request(app).post('/api/auth/login').send({ email: 'mgr3@example.com', password: 'Secret123' });
+  const managerToken = mgrLogin.body.token; const managerId = mgrLogin.body.user._id;
   const financeToken = await registerAndLogin({ name: 'Fin3', email: 'fin3@example.com', password: 'Secret123', role: 'finance' });
-  const employeeToken = await registerAndLogin({ name: 'Emp3', email: 'emp3@example.com', password: 'Secret123', role: 'employee' });
+  const employeeToken = await createEmployeeWithManager('Emp3','emp3@example.com', managerId);
 
   // Draft
   const draftRes = await request(app)
@@ -147,8 +161,11 @@ test('forbidden and invalid transitions: employee cannot approve; cannot approve
 });
 
 test('employee cannot submit someone else\'s draft', async () => {
-  const employee1Token = await registerAndLogin({ name: 'Emp4A', email: 'emp4a@example.com', password: 'Secret123', role: 'employee' });
-  const employee2Token = await registerAndLogin({ name: 'Emp4B', email: 'emp4b@example.com', password: 'Secret123', role: 'employee' });
+  await request(app).post('/api/auth/register').send({ name: 'Mgr4', email: 'mgr4@example.com', password: 'Secret123', role: 'manager' });
+  const mgrLogin = await request(app).post('/api/auth/login').send({ email: 'mgr4@example.com', password: 'Secret123' });
+  const managerId = mgrLogin.body.user._id;
+  const employee1Token = await (async ()=>{await request(app).post('/api/auth/register').send({ name: 'Emp4A', email: 'emp4a@example.com', password: 'Secret123', role: 'employee', manager: managerId }); const l= await request(app).post('/api/auth/login').send({ email: 'emp4a@example.com', password: 'Secret123' }); return l.body.token;})();
+  const employee2Token = await (async ()=>{await request(app).post('/api/auth/register').send({ name: 'Emp4B', email: 'emp4b@example.com', password: 'Secret123', role: 'employee', manager: managerId }); const l= await request(app).post('/api/auth/login').send({ email: 'emp4b@example.com', password: 'Secret123' }); return l.body.token;})();
   const draftRes = await request(app)
     .post('/api/claims')
     .set('Authorization', `Bearer ${employee1Token}`)

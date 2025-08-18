@@ -4,23 +4,28 @@
  */
 // eslint-disable-next-line no-unused-vars
 module.exports = (err, _req, res, _next) => {
-  console.error("❌ Error:", err); // Log full error server-side
-  if (res.headersSent) return; // Avoid sending twice
+  if (res.headersSent) return;
+  let status = err.status || 500;
+  let code = err.code || 'INTERNAL_ERROR';
+  let message = err.message || 'Internal Server Error';
+  let details;
 
-  let status = 500;
-  let message = "Internal Server Error";
-
-  // Mongoose validation errors
-  if (err.name === "ValidationError") {
-    status = 400;
-    message = err.message;
+  // Mongoose validation
+  if (err.name === 'ValidationError') {
+    status = 400; code = 'VALIDATION_ERROR';
+    details = Object.values(err.errors).map(e => ({ field: e.path, message: e.message }));
+    message = 'Validation failed';
   }
-
-  // Duplicate key error
-  if (err.code && err.code === 11000) {
-    status = 409;
-    message = `Duplicate value for field(s): ${Object.keys(err.keyValue).join(", ")}`;
+  // Duplicate key
+  else if (err.code === 11000) {
+    status = 409; code = 'DUPLICATE_KEY';
+    details = Object.keys(err.keyValue).map(k => ({ field: k, value: err.keyValue[k] }));
+    message = 'Duplicate key error';
   }
-
-  return res.status(status).json({ message });
+  // Fallback sanitize
+  if (status >= 500) {
+    console.error('❌ Error:', err); // full stack only for server logs
+    message = 'Internal Server Error';
+  }
+  return res.status(status).json({ error: { code, message, ...(details?{details}: {}) } });
 };
