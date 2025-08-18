@@ -52,7 +52,7 @@ exports.authorize = (...roles) => {
       return res.status(500).json({ message: "User context missing before authorization" });
     }
     if (!allowed.has(req.user.role)) {
-      return res.status(403).json({ message: "Forbidden: insufficient role" });
+      return res.status(403).json({ message: "Forbidden: insufficient role", currentRole: req.user.role });
     }
     next();
   };
