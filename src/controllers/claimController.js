@@ -57,7 +57,14 @@ exports.createClaim = async (req, res, next) => {
       ],
     });
   const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
-  return res.status(201).json({ claim, effectiveClaimLimit });
+  // Remaining = effective - sum of submitted/approved/reimbursed amounts (exclude drafts & rejected)
+  const used = await Claim.aggregate([
+    { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]);
+  const usedAmount = used.length ? used[0].total : 0;
+  const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
+  return res.status(201).json({ claim, effectiveClaimLimit, remainingClaimLimit: remaining });
   } catch (err) {
     return next(err);
   }
@@ -74,7 +81,15 @@ exports.listMyClaims = async (req, res, next) => {
       Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),
       Claim.countDocuments(query)
     ]);
-    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items });
+    // Provide current remaining limit snapshot for UI convenience
+    const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
+    const used = await Claim.aggregate([
+      { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const usedAmount = used.length ? used[0].total : 0;
+    const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
+    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items, effectiveClaimLimit, remainingClaimLimit: remaining });
   } catch (err) {
     return next(err);
   }
@@ -91,18 +106,31 @@ exports.submitClaim = async (req, res, next) => {
     if (claim.status !== "draft") {
       return res.status(400).json({ message: "Only draft claims can be submitted" });
     }
-    // Enforce allowed claim limit when submitting
+    // Enforce allowed claim limit when submitting (cumulative usage)
     try {
       const allowedLimit = await Config.getEffectiveClaimLimit(req.user);
-      if (claim.amount > allowedLimit) {
-        return res.status(400).json({ message: `Claim amount exceeds allowed limit (${allowedLimit})` });
+      const usedAgg = await Claim.aggregate([
+        { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]);
+      const usedSoFar = usedAgg.length ? usedAgg[0].total : 0;
+      if (usedSoFar + claim.amount > allowedLimit) {
+        return res.status(400).json({ message: `Claim amount exceeds allowed remaining (${allowedLimit - usedSoFar})` });
       }
     } catch (e) {
       return res.status(500).json({ message: "Unable to determine claim limit", detail: e.message });
     }
     claim.transitionTo("submitted");
     await claim.save();
-    return res.json({ claim });
+    // Recompute remaining after including this claim
+    const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
+    const used = await Claim.aggregate([
+      { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const usedAmount = used.length ? used[0].total : 0;
+    const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
+    return res.json({ claim, effectiveClaimLimit, remainingClaimLimit: remaining });
   } catch (err) {
     return next(err);
   }
@@ -241,6 +269,80 @@ exports.listForFinance = async (req, res, next) => {
       Claim.countDocuments(query),
     ]);
     return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// Update an existing draft claim (owner only, still in draft)
+// PATCH /api/claims/:id  (fields: title, description, amount, receipt(optional))
+exports.updateDraftClaim = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { title, amount, description } = req.body;
+    const claim = await Claim.findById(id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+    if (claim.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your claim' });
+    }
+    if (claim.status !== 'draft') {
+      return res.status(400).json({ message: 'Only draft claims can be edited' });
+    }
+    if (title !== undefined) {
+      if (!title) return res.status(400).json({ message: 'Title cannot be empty' });
+      claim.title = title;
+    }
+    if (description !== undefined) claim.description = description;
+    if (amount !== undefined) {
+      const numericAmount = Number(amount);
+      if (!(numericAmount > 0)) return res.status(400).json({ message: 'Amount must be greater than 0' });
+      claim.amount = numericAmount;
+    }
+    if (req.file) {
+      const rel = path.relative(process.cwd(), req.file.path).replace(/\\/g, '/');
+      claim.receipt = rel; // update primary receipt path
+      claim.attachments.push({
+        originalName: req.file.originalname,
+        filename: req.file.filename,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        path: rel,
+      });
+    }
+    await claim.save();
+    const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
+    return res.json({ claim, effectiveClaimLimit });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// Delete an existing draft claim (owner only, only while in draft)
+// DELETE /api/claims/:id
+exports.deleteDraftClaim = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const claim = await Claim.findById(id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+    if (claim.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not your claim' });
+    }
+    if (claim.status !== 'draft') {
+      return res.status(400).json({ message: 'Only draft claims can be deleted' });
+    }
+    // Attempt to delete receipt & attachments from disk (best effort)
+    const paths = [];
+    if (claim.receipt) paths.push(path.join(process.cwd(), claim.receipt));
+    if (Array.isArray(claim.attachments)) {
+      for (const a of claim.attachments) {
+        if (a.path) paths.push(path.join(process.cwd(), a.path));
+      }
+    }
+    for (const p of new Set(paths)) {
+      fs.promises.unlink(p).catch(()=>{}); // ignore errors
+    }
+    await claim.deleteOne();
+    return res.status(204).end();
   } catch (err) {
     return next(err);
   }

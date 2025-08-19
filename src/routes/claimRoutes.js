@@ -32,6 +32,12 @@ const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024
 // Employee create draft claim
 router.post("/", protect, authorize("employee", "manager"), upload.single("receipt"), claimController.createClaim);
 
+// Employee update existing draft claim (partial)
+router.patch('/:id', protect, authorize('employee','manager'), upload.single('receipt'), claimController.updateDraftClaim);
+
+// Employee delete draft claim
+router.delete('/:id', protect, authorize('employee','manager'), claimController.deleteDraftClaim);
+
 // Employee list own claims (with optional pagination)
 router.get("/mine", protect, authorize("employee", "manager"), claimController.listMyClaims);
 

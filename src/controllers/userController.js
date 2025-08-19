@@ -6,6 +6,7 @@
 
 const { User } = require("../models");
 const AppError = require('../utils/AppError');
+const { Config } = require('../models');
 
 // PATCH /api/users/:id/limit  (admin, finance)
 // Body: { claimLimit: <number|null> }
@@ -59,6 +60,98 @@ exports.listManagers = async (_req, res, next) => {
   try {
     const managers = await User.find({ role: 'manager', isActive: true }, { name: 1, email: 1 }).sort({ name: 1 });
     return res.json({ managers });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET /api/users/:id/claim-limit (self, admin, finance, manager of employee)
+exports.getClaimLimit = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const target = await User.findById(id);
+    if (!target) throw AppError.notFound('User not found');
+
+    // Authorization
+    const requester = req.user;
+    const isSelf = requester._id.toString() === target._id.toString();
+    const elevated = ['admin','finance'].includes(requester.role);
+    const managerOf = requester.role === 'manager' && target.manager && target.manager.toString() === requester._id.toString();
+    if (!(isSelf || elevated || managerOf)) {
+      throw AppError.forbidden('Not authorized to view this claim limit','CLAIM_LIMIT_FORBIDDEN');
+    }
+
+    // Compute effective claim limit
+    const cfg = await Config.getConfig();
+    let source = 'default';
+    let effective = cfg.defaultClaimLimit;
+    if (target.claimLimit !== null && target.claimLimit !== undefined) {
+      effective = target.claimLimit; source = 'override';
+    } else if (cfg.roleClaimLimits && cfg.roleClaimLimits.has(target.role)) {
+      effective = cfg.roleClaimLimits.get(target.role); source = 'role';
+    }
+
+    // Compute used toward limit (exclude drafts & rejected)
+    const { Claim } = require('../models');
+    const usedAgg = await Claim.aggregate([
+      { $match: { user: target._id, status: { $in: ['submitted','approved','reimbursed'] } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    const used = usedAgg.length ? usedAgg[0].total : 0;
+    const remaining = Math.max(effective - used, 0);
+    return res.json({
+      userId: target._id,
+      role: target.role,
+      claimLimitOverride: target.claimLimit,
+      effectiveClaimLimit: effective,
+      usedClaimAmount: used,
+      remainingClaimLimit: remaining,
+      source
+    });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET /api/users/:id  (self, admin, finance, manager of employee)
+exports.getUser = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id).select('-password');
+    if (!user) throw AppError.notFound('User not found');
+    const requester = req.user;
+    const isSelf = requester._id.toString() === user._id.toString();
+    const elevated = ['admin','finance'].includes(requester.role);
+    const managerOf = requester.role === 'manager' && user.manager && user.manager.toString() === requester._id.toString();
+    if (!(isSelf || elevated || managerOf)) {
+      throw AppError.forbidden('Not authorized to view this user','USER_FORBIDDEN');
+    }
+    return res.json({ user });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET /api/users/:id/manager  (self (if employee), admin, finance, manager-of manager itself)
+exports.getUserManager = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id).select('manager role');
+    if (!user) throw AppError.notFound('User not found');
+    if (user.role !== 'employee') {
+      return res.status(400).json({ message: 'User is not an employee and has no manager' });
+    }
+    const requester = req.user;
+    const isSelf = requester._id.toString() === user._id.toString();
+    const elevated = ['admin','finance'].includes(requester.role);
+    const isManager = requester.role === 'manager' && user.manager && user.manager.toString() === requester._id.toString();
+    if (!(isSelf || elevated || isManager)) {
+      throw AppError.forbidden('Not authorized to view manager info','MANAGER_INFO_FORBIDDEN');
+    }
+    if (!user.manager) return res.status(404).json({ message: 'Manager not set' });
+    const manager = await User.findById(user.manager).select('name email role');
+    if (!manager) return res.status(404).json({ message: 'Manager not found' });
+    return res.json({ manager });
   } catch (err) {
     return next(err);
   }

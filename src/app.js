@@ -3,6 +3,7 @@ const express = require('express');
 const connectDB = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
 const notFound = require('./middleware/notFound');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -28,6 +29,7 @@ app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/claims', require('./routes/claimRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/config', require('./routes/configRoutes'));
+app.use('/uploads', require('./routes/fileRoutes'));
 app.use(notFound);
 app.use(errorHandler);
 

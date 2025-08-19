@@ -8,7 +8,7 @@ const mongoose = require("mongoose");
 
 const ConfigSchema = new mongoose.Schema(
   {
-    defaultClaimLimit: { type: Number, required: true, default: 1000, min: 0 },
+  defaultClaimLimit: { type: Number, required: true, default: 500, min: 0 },
     roleClaimLimits: {
       type: Map,
       of: { type: Number, min: 0 },
