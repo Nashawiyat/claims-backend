@@ -35,7 +35,7 @@ function buildAuthResponse(user) {
 // POST /api/auth/register
 exports.register = async (req, res, next) => {
   try {
-    const { name, email, password, role, manager, claimLimit } = req.body;
+  const { name, email, password, role, manager, claimLimit } = req.body;
 
     // Basic validation
     if (!name || !email || !password) {
@@ -51,6 +51,11 @@ exports.register = async (req, res, next) => {
       return res.status(409).json({ message: "Email already registered" });
     }
 
+    // Additional validation: employee must have manager
+    const effectiveRole = role || 'employee';
+    if (effectiveRole === 'employee' && !manager) {
+      return res.status(400).json({ message: 'Employee registration requires manager id' });
+    }
     // Create user (password hashing handled by model pre-save hook)
     const user = await User.create({
       name,

@@ -53,3 +53,13 @@ exports.updateManager = async (req, res, next) => {
     return next(err);
   }
 };
+
+// GET /api/users/managers  (public for registration UI or could restrict)
+exports.listManagers = async (_req, res, next) => {
+  try {
+    const managers = await User.find({ role: 'manager', isActive: true }, { name: 1, email: 1 }).sort({ name: 1 });
+    return res.json({ managers });
+  } catch (err) {
+    return next(err);
+  }
+};
