@@ -39,7 +39,8 @@ exports.createClaim = async (req, res, next) => {
 
     const claim = await Claim.create({
       user: req.user._id,
-  manager: req.user.manager || null,
+      manager: req.user.role === 'employee' ? (req.user.manager || null) : (req.user.manager || null), // for managers could be null
+      userRole: req.user.role,
       title,
       description,
       amount: numericAmount,
@@ -116,8 +117,15 @@ exports.approveClaim = async (req, res, next) => {
       return res.status(400).json({ message: "Only submitted claims can be approved" });
     }
     if (req.user.role === 'manager') {
-      const ok = await ensureManagerOf(claim, req.user._id);
-      if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
+      // prevent self-approval
+      if (claim.user.toString() === req.user._id.toString()) {
+        return res.status(403).json({ message: 'Managers cannot approve their own claims' });
+      }
+      // If claim belongs to an employee ensure direct report
+      if (claim.userRole === 'employee') {
+        const ok = await ensureManagerOf(claim, req.user._id);
+        if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
+      }
     }
     claim.transitionTo("approved");
     claim.managerReviewer = req.user._id;
@@ -134,12 +142,17 @@ exports.rejectClaim = async (req, res, next) => {
     const { reason } = req.body;
     const claim = await Claim.findById(req.params.id);
     if (!claim) return res.status(404).json({ message: "Claim not found" });
+    if (req.user.role === 'manager') {
+      if (claim.user.toString() === req.user._id.toString()) {
+        return res.status(403).json({ message: 'Managers cannot reject their own claims' });
+      }
+      if (claim.userRole === 'employee') {
+        const ok = await ensureManagerOf(claim, req.user._id);
+        if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
+      }
+    }
     if (claim.status !== "submitted") {
       return res.status(400).json({ message: "Only submitted claims can be rejected" });
-    }
-    if (req.user.role === 'manager') {
-      const ok = await ensureManagerOf(claim, req.user._id);
-      if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
     }
     claim.transitionTo("rejected");
     claim.managerReviewer = req.user._id;

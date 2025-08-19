@@ -30,13 +30,13 @@ function fileFilter(_req, file, cb) {
 const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Employee create draft claim
-router.post("/", protect, authorize("employee"), upload.single("receipt"), claimController.createClaim);
+router.post("/", protect, authorize("employee", "manager"), upload.single("receipt"), claimController.createClaim);
 
 // Employee list own claims (with optional pagination)
-router.get("/mine", protect, authorize("employee"), claimController.listMyClaims);
+router.get("/mine", protect, authorize("employee", "manager"), claimController.listMyClaims);
 
 // Employee submit draft claim
-router.put("/:id/submit", protect, authorize("employee"), claimController.submitClaim);
+router.put("/:id/submit", protect, authorize("employee", "manager"), claimController.submitClaim);
 
 // Manager approve / reject
 router.put("/:id/approve", protect, authorize("manager"), claimController.approveClaim);

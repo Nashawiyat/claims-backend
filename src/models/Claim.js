@@ -41,6 +41,12 @@ const ClaimSchema = new mongoose.Schema(
       ref: 'User',
       index: true,
     },
+    userRole: { // snapshot of creator's role to avoid populate in manager list
+      type: String,
+      enum: ["employee", "manager", "finance", "admin"],
+      required: true,
+      index: true,
+    },
     title: { type: String, required: true, trim: true, maxlength: 140 },
     description: { type: String, trim: true, maxlength: 2000 },
     amount: { type: Number, required: true, min: 0 },
@@ -66,6 +72,7 @@ const ClaimSchema = new mongoose.Schema(
 // Useful indexes
 ClaimSchema.index({ user: 1, status: 1, createdAt: -1 });
 ClaimSchema.index({ manager: 1, status: 1, createdAt: -1 });
+ClaimSchema.index({ userRole: 1, status: 1, createdAt: -1 });
 ClaimSchema.index({ status: 1, createdAt: -1 });
 
 // Basic status transition validation (soft enforcement; can be extended)
