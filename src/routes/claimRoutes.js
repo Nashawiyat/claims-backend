@@ -29,34 +29,34 @@ function fileFilter(_req, file, cb) {
 
 const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
-// Employee create draft claim
-router.post("/", protect, authorize("employee", "manager"), upload.single("receipt"), claimController.createClaim);
+// Create draft claim (employee, manager, admin)
+router.post("/", protect, authorize("employee", "manager", "admin"), upload.single("receipt"), claimController.createClaim);
 
-// Employee update existing draft claim (partial)
-router.patch('/:id', protect, authorize('employee','manager'), upload.single('receipt'), claimController.updateDraftClaim);
+// Update existing draft claim (owner: employee, manager, admin)
+router.patch('/:id', protect, authorize('employee','manager','admin'), upload.single('receipt'), claimController.updateDraftClaim);
 
-// Employee delete draft claim
-router.delete('/:id', protect, authorize('employee','manager'), claimController.deleteDraftClaim);
+// Delete draft claim (owner)
+router.delete('/:id', protect, authorize('employee','manager','admin'), claimController.deleteDraftClaim);
 
-// Employee list own claims (with optional pagination)
-router.get("/mine", protect, authorize("employee", "manager"), claimController.listMyClaims);
+// List own claims
+router.get("/mine", protect, authorize("employee", "manager", "admin"), claimController.listMyClaims);
 
 
-// Employee submit draft claim
-router.put("/:id/submit", protect, authorize("employee", "manager"), claimController.submitClaim);
+// Submit draft claim
+router.put("/:id/submit", protect, authorize("employee", "manager", "admin"), claimController.submitClaim);
 
-// Manager approve / reject
-router.put("/:id/approve", protect, authorize("manager"), claimController.approveClaim);
-router.put("/:id/reject", protect, authorize("manager"), claimController.rejectClaim);
+// Approve / reject (manager or admin)
+router.put("/:id/approve", protect, authorize("manager","admin"), claimController.approveClaim);
+router.put("/:id/reject", protect, authorize("manager","admin"), claimController.rejectClaim);
 // Claim manager lookup
 router.get('/:id/manager', protect, authorize('employee','manager','finance','admin'), claimController.getClaimManager);
 // Manager list submitted/approved/rejected (filtered)
 router.get("/manager", protect, authorize("manager"), claimController.listSubmitted);
 
-// Finance reimburse
-router.put("/:id/reimburse", protect, authorize("finance"), claimController.reimburseClaim);
-router.put("/:id/reject-finance", protect, authorize("finance"), claimController.financeRejectClaim);
-router.get("/finance", protect, authorize("finance"), claimController.listForFinance);
+// Finance reimburse (finance or admin)
+router.put("/:id/reimburse", protect, authorize("finance","admin"), claimController.reimburseClaim);
+router.put("/:id/reject-finance", protect, authorize("finance","admin"), claimController.financeRejectClaim);
+router.get("/finance", protect, authorize("finance","admin"), claimController.listForFinance);
 
 // Get single claim (owner, assigned manager, finance, admin) - placed after other specific routes
 router.get('/:id', protect, authorize('employee','manager','finance','admin'), claimController.getClaim);

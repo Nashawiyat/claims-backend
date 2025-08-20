@@ -39,9 +39,9 @@ exports.createClaim = async (req, res, next) => {
 
     // Determine manager snapshot logic
     let managerSnapshot = null;
-    if (req.user.role === 'employee') {
+  if (req.user.role === 'employee') {
       managerSnapshot = req.user.manager || null;
-    } else if (req.user.role === 'manager') {
+  } else if (req.user.role === 'manager') {
       // Allow a manager to optionally pick ANOTHER manager to review their claim via form field 'manager'
       const provided = req.body.manager;
       if (provided) {
@@ -59,6 +59,9 @@ exports.createClaim = async (req, res, next) => {
         }
         managerSnapshot = mgrUser._id; // snapshot chosen manager
       }
+    } else if (req.user.role === 'admin') {
+      // Admin acts as its own reviewer chain; no manager required
+      managerSnapshot = null;
     }
 
     const claim = await Claim.create({
@@ -169,15 +172,17 @@ exports.approveClaim = async (req, res, next) => {
       return res.status(400).json({ message: "Only submitted claims can be approved" });
     }
     if (req.user.role === 'manager') {
-      // prevent self-approval
       if (claim.user.toString() === req.user._id.toString()) {
         return res.status(403).json({ message: 'Managers cannot approve their own claims' });
       }
-      // If claim belongs to an employee ensure direct report
       if (claim.userRole === 'employee') {
         const ok = await ensureManagerOf(claim, req.user._id);
         if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
       }
+    }
+    // Admin pathway: allow approving any submitted claim including their own when manager is null
+    if (req.user.role === 'admin') {
+      // no additional checks; admin can self-approve when manager is null
     }
     claim.transitionTo("approved");
     claim.managerReviewer = req.user._id;
@@ -188,7 +193,7 @@ exports.approveClaim = async (req, res, next) => {
   }
 };
 
-// Reject claim (manager)
+// Reject claim (manager or admin)
 exports.rejectClaim = async (req, res, next) => {
   try {
     const { reason } = req.body;
@@ -203,6 +208,7 @@ exports.rejectClaim = async (req, res, next) => {
         if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
       }
     }
+    // Admin can reject any submitted claim including self-claims
     if (claim.status !== "submitted") {
       return res.status(400).json({ message: "Only submitted claims can be rejected" });
     }
@@ -216,7 +222,7 @@ exports.rejectClaim = async (req, res, next) => {
   }
 };
 
-// Reimburse claim (finance)
+// Reimburse claim (finance or admin)
 exports.reimburseClaim = async (req, res, next) => {
   try {
     const claim = await Claim.findById(req.params.id);
@@ -262,6 +268,8 @@ exports.listSubmitted = async (req, res, next) => {
     const query = { status: status && allowedStatuses.includes(status) ? status : 'submitted' };
     if (req.user.role === 'manager') {
       query.manager = req.user._id; // use snapshot index
+    } else if (req.user.role === 'admin') {
+      // Admin sees all submitted by default
     }
     const [items, total] = await Promise.all([
       Claim.find(query)

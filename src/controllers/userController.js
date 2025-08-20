@@ -7,6 +7,7 @@
 const { User } = require("../models");
 const AppError = require('../utils/AppError');
 const { Config } = require('../models');
+const mongoose = require('mongoose');
 
 // PATCH /api/users/:id/limit  (admin, finance)
 // Body: { claimLimit: <number|null> }
@@ -69,6 +70,7 @@ exports.listManagers = async (_req, res, next) => {
 exports.getClaimLimit = async (req, res, next) => {
   try {
     const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) throw AppError.badRequest('Invalid user id','INVALID_USER_ID');
     const target = await User.findById(id);
     if (!target) throw AppError.notFound('User not found');
 
@@ -117,7 +119,8 @@ exports.getClaimLimit = async (req, res, next) => {
 exports.getUser = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const user = await User.findById(id).select('-password');
+  if (!mongoose.Types.ObjectId.isValid(id)) throw AppError.badRequest('Invalid user id','INVALID_USER_ID');
+  const user = await User.findById(id).select('-password');
     if (!user) throw AppError.notFound('User not found');
     const requester = req.user;
     const isSelf = requester._id.toString() === user._id.toString();
@@ -136,7 +139,8 @@ exports.getUser = async (req, res, next) => {
 exports.getUserManager = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const user = await User.findById(id).select('manager role');
+  if (!mongoose.Types.ObjectId.isValid(id)) throw AppError.badRequest('Invalid user id','INVALID_USER_ID');
+  const user = await User.findById(id).select('manager role');
     if (!user) throw AppError.notFound('User not found');
     if (user.role !== 'employee') {
       return res.status(400).json({ message: 'User is not an employee and has no manager' });
@@ -152,6 +156,21 @@ exports.getUserManager = async (req, res, next) => {
     const manager = await User.findById(user.manager).select('name email role');
     if (!manager) return res.status(404).json({ message: 'Manager not found' });
     return res.json({ manager });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET /api/users/lookup?email=...  (admin, finance)
+// Returns minimal user info by email; used by front-end to decide UI actions (e.g., disallow editing admin limits)
+exports.lookupUserByEmail = async (req, res, next) => {
+  try {
+    const { email } = req.query;
+    if (!email || typeof email !== 'string') throw AppError.badRequest('email query parameter required','EMAIL_REQUIRED');
+    const normalized = email.trim().toLowerCase();
+    const user = await User.findOne({ email: normalized }).select('-password');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    return res.json({ user });
   } catch (err) {
     return next(err);
   }
