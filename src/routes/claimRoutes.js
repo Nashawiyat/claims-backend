@@ -41,12 +41,15 @@ router.delete('/:id', protect, authorize('employee','manager'), claimController.
 // Employee list own claims (with optional pagination)
 router.get("/mine", protect, authorize("employee", "manager"), claimController.listMyClaims);
 
+
 // Employee submit draft claim
 router.put("/:id/submit", protect, authorize("employee", "manager"), claimController.submitClaim);
 
 // Manager approve / reject
 router.put("/:id/approve", protect, authorize("manager"), claimController.approveClaim);
 router.put("/:id/reject", protect, authorize("manager"), claimController.rejectClaim);
+// Claim manager lookup
+router.get('/:id/manager', protect, authorize('employee','manager','finance','admin'), claimController.getClaimManager);
 // Manager list submitted/approved/rejected (filtered)
 router.get("/manager", protect, authorize("manager"), claimController.listSubmitted);
 
@@ -54,5 +57,8 @@ router.get("/manager", protect, authorize("manager"), claimController.listSubmit
 router.put("/:id/reimburse", protect, authorize("finance"), claimController.reimburseClaim);
 router.put("/:id/reject-finance", protect, authorize("finance"), claimController.financeRejectClaim);
 router.get("/finance", protect, authorize("finance"), claimController.listForFinance);
+
+// Get single claim (owner, assigned manager, finance, admin) - placed after other specific routes
+router.get('/:id', protect, authorize('employee','manager','finance','admin'), claimController.getClaim);
 
 module.exports = router;

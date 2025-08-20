@@ -25,7 +25,7 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 // Create draft claim (employee)
 exports.createClaim = async (req, res, next) => {
   try {
-    const { title, amount, description } = req.body;
+  const { title, amount, description } = req.body;
     if (!title || !amount) {
       return res.status(400).json({ message: "Title and amount are required" });
     }
@@ -37,9 +37,33 @@ exports.createClaim = async (req, res, next) => {
       return res.status(400).json({ message: "Receipt file is required" });
     }
 
+    // Determine manager snapshot logic
+    let managerSnapshot = null;
+    if (req.user.role === 'employee') {
+      managerSnapshot = req.user.manager || null;
+    } else if (req.user.role === 'manager') {
+      // Allow a manager to optionally pick ANOTHER manager to review their claim via form field 'manager'
+      const provided = req.body.manager;
+      if (provided) {
+        const { User } = require('../models');
+        const isValidId = require('mongoose').Types.ObjectId.isValid(provided);
+        if (!isValidId) {
+          return res.status(400).json({ message: 'Invalid manager id supplied' });
+        }
+        if (provided.toString() === req.user._id.toString()) {
+          return res.status(400).json({ message: 'Cannot assign yourself as reviewing manager' });
+        }
+        const mgrUser = await User.findById(provided).select('role isActive');
+        if (!mgrUser || !mgrUser.isActive || mgrUser.role !== 'manager') {
+          return res.status(400).json({ message: 'Provided reviewer must be an active manager' });
+        }
+        managerSnapshot = mgrUser._id; // snapshot chosen manager
+      }
+    }
+
     const claim = await Claim.create({
       user: req.user._id,
-      manager: req.user.role === 'employee' ? (req.user.manager || null) : (req.user.manager || null), // for managers could be null
+      manager: managerSnapshot, // may be null (self-claim) or chosen manager
       userRole: req.user.role,
       title,
       description,
@@ -240,10 +264,23 @@ exports.listSubmitted = async (req, res, next) => {
       query.manager = req.user._id; // use snapshot index
     }
     const [items, total] = await Promise.all([
-      Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),
+      Claim.find(query)
+        .sort({ createdAt: -1 })
+        .skip((parsedPage - 1) * parsedLimit)
+        .limit(parsedLimit)
+        // Provide creator basic identity (name, role) so reviewing manager can display submitter
+        .populate('user', 'name role'),
       Claim.countDocuments(query),
     ]);
-    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items });
+    // Normalize: expose a consistent "employee" field (even if creator is a manager) for UI labels
+    const claims = items.map(doc => {
+      const o = doc.toObject({ getters: true });
+      if (doc.user) {
+        o.employee = { _id: doc.user._id, name: doc.user.name, role: doc.user.role };
+      }
+      return o;
+    });
+    return res.json({ page: parsedPage, limit: parsedLimit, total, claims });
   } catch (err) {
     return next(err);
   }
@@ -309,6 +346,28 @@ exports.updateDraftClaim = async (req, res, next) => {
         path: rel,
       });
     }
+    // Allow manager creator to change assigned reviewing manager while in draft
+    if (claim.userRole === 'manager' && req.user.role === 'manager' && req.body.manager !== undefined) {
+      const provided = req.body.manager;
+      if (provided === null || provided === 'null' || provided === '') {
+        // Explicit clear -> self-claim (no reviewer yet)
+        claim.manager = null;
+      } else {
+        const { Types } = require('mongoose');
+        if (!Types.ObjectId.isValid(provided)) {
+          return res.status(400).json({ message: 'Invalid manager id supplied' });
+        }
+        if (provided.toString() === req.user._id.toString()) {
+          return res.status(400).json({ message: 'Cannot assign yourself as reviewing manager' });
+        }
+        const { User } = require('../models');
+        const mgrUser = await User.findById(provided).select('role isActive');
+        if (!mgrUser || !mgrUser.isActive || mgrUser.role !== 'manager') {
+          return res.status(400).json({ message: 'Provided reviewer must be an active manager' });
+        }
+        claim.manager = mgrUser._id;
+      }
+    }
     await claim.save();
     const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
     return res.json({ claim, effectiveClaimLimit });
@@ -343,6 +402,67 @@ exports.deleteDraftClaim = async (req, res, next) => {
     }
     await claim.deleteOne();
     return res.status(204).end();
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET manager info for a claim
+// GET /api/claims/:id/manager  (claim owner, claim's manager, finance, admin)
+exports.getClaimManager = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const claim = await Claim.findById(id).select('user manager');
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+    const requester = req.user;
+    const isOwner = claim.user.toString() === requester._id.toString();
+    const isClaimManager = claim.manager && claim.manager.toString() === requester._id.toString();
+    const elevated = ['admin','finance'].includes(requester.role);
+    if (!(isOwner || isClaimManager || elevated)) {
+      return res.status(403).json({ message: 'Not authorized to view manager for this claim' });
+    }
+    if (!claim.manager) {
+      return res.status(404).json({ message: 'No manager associated with this claim' });
+    }
+    const { User } = require('../models');
+    const manager = await User.findById(claim.manager).select('name email role');
+    if (!manager) return res.status(404).json({ message: 'Manager not found' });
+    return res.json({ manager });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// GET single claim with creator (and optional manager) info
+// GET /api/claims/:id  (owner, assigned manager snapshot, finance, admin)
+exports.getClaim = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { Types } = require('mongoose');
+    if (!Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ message: 'Claim not found' });
+    }
+    const claim = await Claim.findById(id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+    const requester = req.user;
+    const isOwner = claim.user.toString() === requester._id.toString();
+    const isAssignedManager = claim.manager && claim.manager.toString() === requester._id.toString();
+    const elevated = ['admin','finance'].includes(requester.role);
+    if (!(isOwner || isAssignedManager || elevated)) {
+      return res.status(403).json({ message: 'Not authorized to view this claim' });
+    }
+    const { User } = require('../models');
+    const creator = await User.findById(claim.user).select('name email role');
+    let assignedManager = null;
+    if (claim.manager) {
+      assignedManager = await User.findById(claim.manager).select('name email role');
+    }
+    // Provide a minimal, stable shape for frontend
+    return res.json({
+      claim,
+      creator,
+      assignedManager
+    });
   } catch (err) {
     return next(err);
   }
