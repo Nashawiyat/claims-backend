@@ -27,5 +27,5 @@ module.exports = (err, _req, res, _next) => {
     console.error('❌ Error:', err); // full stack only for server logs
     message = 'Internal Server Error';
   }
-  return res.status(status).json({ error: { code, message, ...(details?{details}: {}) } });
+  return res.status(status).json({ success: false, error: message, code, ...(details?{details}: {}) });
 };

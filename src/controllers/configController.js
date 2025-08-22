@@ -4,32 +4,72 @@
  * Admin operations for global configuration (singleton document).
  */
 
-const { Config, User } = require("../models");
+const { Config, User, ConfigHistory } = require("../models");
 
-// PATCH /api/config  (admin only)
-// Body: { defaultClaimLimit: number }
-exports.updateConfig = async (req, res, next) => {
+// GET /api/config  (finance, admin)
+exports.getConfig = async (req, res, next) => {
   try {
-    const { defaultClaimLimit } = req.body;
-    if (defaultClaimLimit === undefined) {
-      return res.status(400).json({ message: "defaultClaimLimit is required" });
-    }
-    const numeric = Number(defaultClaimLimit);
-    if (!Number.isFinite(numeric) || numeric < 0) {
-      return res.status(400).json({ message: "defaultClaimLimit must be a non-negative number" });
-    }
     const cfg = await Config.getConfig();
-    cfg.defaultClaimLimit = numeric;
-    cfg.updatedBy = req.user._id;
-    await cfg.save();
     return res.json({ config: cfg });
-  } catch (err) {
-    return next(err);
-  }
+  } catch (err) { return next(err); }
 };
 
-// PUT /api/config/default-limit  (finance, admin)
-// Body: { defaultLimit:number }
+// PUT /api/config  (finance, admin)
+// Body can include: { defaultLimits:{ employee, manager, admin }, resetPolicy:{ cycle, resetDate } }
+// Validation rules: admin limit editable only by admin; employee/manager by finance or admin; finance limit not supported.
+exports.putConfig = async (req, res, next) => {
+  try {
+    const { defaultLimits, resetPolicy } = req.body || {};
+    const cfg = await Config.getConfig();
+    const before = cfg.toObject();
+    const isAdmin = req.user.role === 'admin';
+    const isFinance = req.user.role === 'finance';
+
+    // Update default limits
+    if (defaultLimits) {
+      const allowedRoles = ['employee','manager'];
+      if (defaultLimits.employee !== undefined) {
+        if (!(isAdmin || isFinance)) return res.status(403).json({ message: 'Not authorized to edit employee default limit' });
+        const v = Number(defaultLimits.employee); if (!Number.isFinite(v) || v < 0) return res.status(400).json({ message: 'Employee default limit must be non-negative number' });
+        cfg.defaultLimits.employee = v;
+      }
+      if (defaultLimits.manager !== undefined) {
+        if (!(isAdmin || isFinance)) return res.status(403).json({ message: 'Not authorized to edit manager default limit' });
+        const v = Number(defaultLimits.manager); if (!Number.isFinite(v) || v < 0) return res.status(400).json({ message: 'Manager default limit must be non-negative number' });
+        cfg.defaultLimits.manager = v;
+      }
+      if (defaultLimits.admin !== undefined) {
+        if (!isAdmin) return res.status(403).json({ message: 'Only admin can edit admin default limit' });
+        const v = Number(defaultLimits.admin); if (!Number.isFinite(v) || v < 0) return res.status(400).json({ message: 'Admin default limit must be non-negative number' });
+        cfg.defaultLimits.admin = v;
+      }
+      // Finance default ignored if provided
+    }
+
+    if (resetPolicy) {
+      if (!(isAdmin || isFinance)) return res.status(403).json({ message: 'Not authorized to edit reset policy' });
+      const { cycle, resetDate } = resetPolicy;
+      if (cycle !== undefined) {
+        const allowed = ['annual','quarterly','monthly'];
+        if (!allowed.includes(cycle)) return res.status(400).json({ message: 'Invalid reset policy cycle' });
+        cfg.resetPolicy.cycle = cycle;
+      }
+      if (resetDate !== undefined) {
+        const d = new Date(resetDate);
+        if (isNaN(d.getTime())) return res.status(400).json({ message: 'Invalid resetDate' });
+        cfg.resetPolicy.resetDate = d;
+      }
+    }
+
+    cfg.updatedBy = req.user._id;
+    await cfg.save();
+    await ConfigHistory.create({ before, after: cfg.toObject(), updatedBy: req.user._id });
+    return res.json({ config: cfg });
+  } catch (err) { return next(err); }
+};
+
+// LEGACY: PUT /api/config/default-limit  (finance, admin)
+// Kept for backwards compatibility; delegates to new putConfig shape.
 exports.setDefaultLimit = async (req, res, next) => {
   try {
     const { defaultLimit } = req.body;
@@ -40,17 +80,15 @@ exports.setDefaultLimit = async (req, res, next) => {
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return res.status(400).json({ message: 'defaultLimit must be a positive number' });
     }
-    const cfg = await Config.getConfig();
-    cfg.defaultClaimLimit = numeric;
-    cfg.updatedBy = req.user._id;
-    await cfg.save();
-    return res.json({ config: cfg });
+  // Map to new structure (employee baseline as legacy global)
+  req.body = { defaultLimits: { employee: numeric } };
+  return exports.putConfig(req, res, next);
   } catch (err) {
     return next(err);
   }
 };
 
-// PUT /api/config/user-limit  (finance, admin)
+// LEGACY: PUT /api/config/user-limit  (finance, admin)
 // Body: { email:string, limit:number, used:number }
 // Note: existing schema has plain claimLimit override (total). 'used' is not tracked separately in user; include basic validation and echo back.
 exports.setUserLimit = async (req, res, next) => {

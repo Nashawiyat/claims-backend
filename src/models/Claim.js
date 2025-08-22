@@ -58,6 +58,7 @@ const ClaimSchema = new mongoose.Schema(
       default: "draft",
       index: true,
     },
+  submittedAt: { type: Date, index: true },
     attachments: { type: [AttachmentSchema], default: [] },
     managerReviewer: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     financeReviewer: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -65,6 +66,7 @@ const ClaimSchema = new mongoose.Schema(
     rejectedAt: { type: Date },
     reimbursedAt: { type: Date },
     rejectionReason: { type: String, maxlength: 1000 },
+  countedInUsage: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );
@@ -74,6 +76,9 @@ ClaimSchema.index({ user: 1, status: 1, createdAt: -1 });
 ClaimSchema.index({ manager: 1, status: 1, createdAt: -1 });
 ClaimSchema.index({ userRole: 1, status: 1, createdAt: -1 });
 ClaimSchema.index({ status: 1, createdAt: -1 });
+ClaimSchema.index({ status: 1, submittedAt: -1 });
+ClaimSchema.index({ status: 1, approvedAt: -1 });
+ClaimSchema.index({ status: 1, amount: -1 });
 
 // Basic status transition validation (soft enforcement; can be extended)
 const VALID_TRANSITIONS = {
@@ -97,6 +102,7 @@ ClaimSchema.methods.transitionTo = function (nextStatus) {
   if (nextStatus === "approved") this.approvedAt = now;
   if (nextStatus === "rejected") this.rejectedAt = now;
   if (nextStatus === "reimbursed") this.reimbursedAt = now;
+  if (nextStatus === "submitted") this.submittedAt = now;
   return this;
 };
 

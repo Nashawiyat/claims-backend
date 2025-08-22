@@ -6,7 +6,10 @@
 
 const path = require("path");
 const fs = require("fs");
-const { Claim, Config } = require("../models");
+const { Claim, Config, User } = require("../models");
+const { success } = require('../utils/apiResponse');
+const { paginate } = require('../services/pagination');
+const { incrementUsed, decrementUsed, recomputeUsedForUser } = require('../services/claimsUsage');
 
 // Helper: ensure a manager is the direct manager of the claim's employee
 async function ensureManagerOf(claim, managerId) {
@@ -25,16 +28,31 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 // Create draft claim (employee)
 exports.createClaim = async (req, res, next) => {
   try {
-  const { title, amount, description } = req.body;
+  const { title, amount, description, submit } = req.body;
     if (!title || !amount) {
-      return res.status(400).json({ message: "Title and amount are required" });
+  return res.status(400).json({ success:false, error: "Title and amount are required" });
     }
     const numericAmount = Number(amount);
     if (!(numericAmount > 0)) {
-      return res.status(400).json({ message: "Amount must be greater than 0" });
+  return res.status(400).json({ success:false, error: "Amount must be greater than 0" });
     }
     if (!req.file) {
-      return res.status(400).json({ message: "Receipt file is required" });
+  return res.status(400).json({ success:false, error: "Receipt file is required" });
+    }
+
+    // If immediate submission requested, enforce limit BEFORE creating claim
+    const wantsImmediateSubmit = submit === 'true' || submit === true
+    if (wantsImmediateSubmit) {
+      try {
+        // Use persisted usedClaimAmount (respects manual resets) instead of re-aggregating historical claims
+        const allowedLimit = await Config.getEffectiveClaimLimit(req.user);
+        const usedSoFar = req.user.usedClaimAmount || 0;
+        if (usedSoFar + numericAmount > allowedLimit) {
+          return res.status(400).json({ success:false, error: `Claim amount exceeds allowed remaining (${Math.max(allowedLimit - usedSoFar,0)})` });
+        }
+      } catch (e) {
+        return res.status(500).json({ success:false, error: 'Unable to determine claim limit', detail: e.message });
+      }
     }
 
     // Determine manager snapshot logic
@@ -42,20 +60,22 @@ exports.createClaim = async (req, res, next) => {
   if (req.user.role === 'employee') {
       managerSnapshot = req.user.manager || null;
   } else if (req.user.role === 'manager') {
+      // Default reviewer to the manager's own supervising manager if present (hierarchical chain)
+      managerSnapshot = req.user.manager || null;
       // Allow a manager to optionally pick ANOTHER manager to review their claim via form field 'manager'
       const provided = req.body.manager;
       if (provided) {
         const { User } = require('../models');
-        const isValidId = require('mongoose').Types.ObjectId.isValid(provided);
-        if (!isValidId) {
-          return res.status(400).json({ message: 'Invalid manager id supplied' });
+        const { Types } = require('mongoose');
+        if (!Types.ObjectId.isValid(provided)) {
+          return res.status(400).json({ success:false, error: 'Invalid manager id supplied' });
         }
         if (provided.toString() === req.user._id.toString()) {
-          return res.status(400).json({ message: 'Cannot assign yourself as reviewing manager' });
+          return res.status(400).json({ success:false, error: 'Cannot assign yourself as reviewing manager' });
         }
         const mgrUser = await User.findById(provided).select('role isActive');
         if (!mgrUser || !mgrUser.isActive || mgrUser.role !== 'manager') {
-          return res.status(400).json({ message: 'Provided reviewer must be an active manager' });
+          return res.status(400).json({ success:false, error: 'Provided reviewer must be an active manager' });
         }
         managerSnapshot = mgrUser._id; // snapshot chosen manager
       }
@@ -64,14 +84,14 @@ exports.createClaim = async (req, res, next) => {
       managerSnapshot = null;
     }
 
-    const claim = await Claim.create({
+  const claim = await Claim.create({
       user: req.user._id,
       manager: managerSnapshot, // may be null (self-claim) or chosen manager
       userRole: req.user.role,
       title,
       description,
       amount: numericAmount,
-      status: "draft",
+    status: submit === 'true' || submit === true ? 'submitted' : 'draft',
       receipt: path.relative(process.cwd(), req.file.path).replace(/\\/g, "/"),
       attachments: [
         {
@@ -83,15 +103,14 @@ exports.createClaim = async (req, res, next) => {
         },
       ],
     });
+  if (claim.status === 'submitted') {
+    claim.submittedAt = new Date();
+    if (!claim.countedInUsage) { await incrementUsed(req.user._id, claim.amount); claim.countedInUsage = true; await claim.save(); }
+  }
   const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
-  // Remaining = effective - sum of submitted/approved/reimbursed amounts (exclude drafts & rejected)
-  const used = await Claim.aggregate([
-    { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
-    { $group: { _id: null, total: { $sum: '$amount' } } }
-  ]);
-  const usedAmount = used.length ? used[0].total : 0;
+  const usedAmount = req.user.usedClaimAmount || 0; // already incremented if submitted
   const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
-  return res.status(201).json({ claim, effectiveClaimLimit, remainingClaimLimit: remaining });
+  return res.status(201).json(success({ claim, effectiveClaimLimit, remainingClaimLimit: remaining }));
   } catch (err) {
     return next(err);
   }
@@ -100,23 +119,23 @@ exports.createClaim = async (req, res, next) => {
 // List current user's claims (employee scope)
 exports.listMyClaims = async (req, res, next) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
-    const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
-    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+    const { page = 1, limit = 20, status, sortBy, sortDir } = req.query;
     const query = { user: req.user._id };
-    const [items, total] = await Promise.all([
-      Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),
-      Claim.countDocuments(query)
-    ]);
-    // Provide current remaining limit snapshot for UI convenience
-    const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
-    const used = await Claim.aggregate([
-      { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-    const usedAmount = used.length ? used[0].total : 0;
-    const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
-    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items, effectiveClaimLimit, remainingClaimLimit: remaining });
+    if (status) query.status = status.toLowerCase();
+    let sortField = 'createdAt';
+    if (['submittedAt','amount','approvedAt'].includes(sortBy)) sortField = sortBy;
+    const sortDirection = sortDir === 'asc' ? 'asc' : 'desc';
+    const response = await paginate(
+      Claim.find(query),
+      () => Claim.countDocuments(query),
+      { page, limit, sortBy: sortField, sortDir: sortDirection, status }
+    );
+  const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
+  const usedAmount = req.user.usedClaimAmount || 0;
+  const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
+  response.data.effectiveClaimLimit = effectiveClaimLimit;
+  response.data.remainingClaimLimit = remaining;
+    return res.json(response);
   } catch (err) {
     return next(err);
   }
@@ -126,38 +145,31 @@ exports.listMyClaims = async (req, res, next) => {
 exports.submitClaim = async (req, res, next) => {
   try {
     const claim = await Claim.findById(req.params.id);
-    if (!claim) return res.status(404).json({ message: "Claim not found" });
+  if (!claim) return res.status(404).json({ success:false, error: "Claim not found" });
     if (claim.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: "Not your claim" });
+  return res.status(403).json({ success:false, error: "Not your claim" });
     }
     if (claim.status !== "draft") {
-      return res.status(400).json({ message: "Only draft claims can be submitted" });
+  return res.status(400).json({ success:false, error: "Only draft claims can be submitted" });
     }
-    // Enforce allowed claim limit when submitting (cumulative usage)
+    // Enforce allowed claim limit when submitting (cumulative usage from persisted counter respecting resets)
     try {
       const allowedLimit = await Config.getEffectiveClaimLimit(req.user);
-      const usedAgg = await Claim.aggregate([
-        { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } }
-      ]);
-      const usedSoFar = usedAgg.length ? usedAgg[0].total : 0;
+      const usedSoFar = req.user.usedClaimAmount || 0;
       if (usedSoFar + claim.amount > allowedLimit) {
-        return res.status(400).json({ message: `Claim amount exceeds allowed remaining (${allowedLimit - usedSoFar})` });
+  return res.status(400).json({ success:false, error: `Claim amount exceeds allowed remaining (${Math.max(allowedLimit - usedSoFar,0)})` });
       }
     } catch (e) {
-      return res.status(500).json({ message: "Unable to determine claim limit", detail: e.message });
+  return res.status(500).json({ success:false, error: "Unable to determine claim limit", detail: e.message });
     }
-    claim.transitionTo("submitted");
+  claim.transitionTo("submitted");
+  if (!claim.countedInUsage) { await incrementUsed(req.user._id, claim.amount); claim.countedInUsage = true; }
     await claim.save();
     // Recompute remaining after including this claim
     const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
-    const used = await Claim.aggregate([
-      { $match: { user: req.user._id, status: { $in: ['submitted','approved','reimbursed'] } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-    const usedAmount = used.length ? used[0].total : 0;
+    const usedAmount = req.user.usedClaimAmount || 0; // incremented earlier
     const remaining = Math.max(effectiveClaimLimit - usedAmount, 0);
-    return res.json({ claim, effectiveClaimLimit, remainingClaimLimit: remaining });
+  return res.json(success({ claim, effectiveClaimLimit, remainingClaimLimit: remaining }));
   } catch (err) {
     return next(err);
   }
@@ -167,27 +179,27 @@ exports.submitClaim = async (req, res, next) => {
 exports.approveClaim = async (req, res, next) => {
   try {
     const claim = await Claim.findById(req.params.id);
-    if (!claim) return res.status(404).json({ message: "Claim not found" });
+  if (!claim) return res.status(404).json({ success:false, error: "Claim not found" });
     if (claim.status !== "submitted") {
-      return res.status(400).json({ message: "Only submitted claims can be approved" });
+  return res.status(400).json({ success:false, error: "Only submitted claims can be approved" });
     }
     if (req.user.role === 'manager') {
       if (claim.user.toString() === req.user._id.toString()) {
-        return res.status(403).json({ message: 'Managers cannot approve their own claims' });
+  return res.status(403).json({ success:false, error: 'Managers cannot approve their own claims' });
       }
       if (claim.userRole === 'employee') {
         const ok = await ensureManagerOf(claim, req.user._id);
-        if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
+  if (!ok) return res.status(403).json({ success:false, error: 'Not manager of this employee' });
       }
     }
     // Admin pathway: allow approving any submitted claim including their own when manager is null
     if (req.user.role === 'admin') {
       // no additional checks; admin can self-approve when manager is null
     }
-    claim.transitionTo("approved");
+  claim.transitionTo("approved");
     claim.managerReviewer = req.user._id;
     await claim.save();
-    return res.json({ claim });
+  return res.json(success({ claim }));
   } catch (err) {
     return next(err);
   }
@@ -198,25 +210,29 @@ exports.rejectClaim = async (req, res, next) => {
   try {
     const { reason } = req.body;
     const claim = await Claim.findById(req.params.id);
-    if (!claim) return res.status(404).json({ message: "Claim not found" });
+  if (!claim) return res.status(404).json({ success:false, error: "Claim not found" });
     if (req.user.role === 'manager') {
       if (claim.user.toString() === req.user._id.toString()) {
-        return res.status(403).json({ message: 'Managers cannot reject their own claims' });
+  return res.status(403).json({ success:false, error: 'Managers cannot reject their own claims' });
       }
       if (claim.userRole === 'employee') {
         const ok = await ensureManagerOf(claim, req.user._id);
-        if (!ok) return res.status(403).json({ message: 'Not manager of this employee' });
+  if (!ok) return res.status(403).json({ success:false, error: 'Not manager of this employee' });
       }
     }
     // Admin can reject any submitted claim including self-claims
     if (claim.status !== "submitted") {
-      return res.status(400).json({ message: "Only submitted claims can be rejected" });
+  return res.status(400).json({ success:false, error: "Only submitted claims can be rejected" });
+    }
+    // If submitted and counted, decrement usage
+    if (claim.countedInUsage && claim.status === 'submitted') {
+      await decrementUsed(claim.user, claim.amount); claim.countedInUsage = false;
     }
     claim.transitionTo("rejected");
     claim.managerReviewer = req.user._id;
     claim.rejectionReason = reason || "";
     await claim.save();
-    return res.json({ claim });
+    return res.json(success({ claim }));
   } catch (err) {
     return next(err);
   }
@@ -226,14 +242,14 @@ exports.rejectClaim = async (req, res, next) => {
 exports.reimburseClaim = async (req, res, next) => {
   try {
     const claim = await Claim.findById(req.params.id);
-    if (!claim) return res.status(404).json({ message: "Claim not found" });
+  if (!claim) return res.status(404).json({ success:false, error: "Claim not found" });
     if (claim.status !== "approved") {
-      return res.status(400).json({ message: "Only approved claims can be reimbursed" });
+  return res.status(400).json({ success:false, error: "Only approved claims can be reimbursed" });
     }
-    claim.transitionTo("reimbursed");
+  claim.transitionTo("reimbursed");
     claim.financeReviewer = req.user._id;
     await claim.save();
-    return res.json({ claim });
+  return res.json(success({ claim }));
   } catch (err) {
     return next(err);
   }
@@ -244,15 +260,16 @@ exports.financeRejectClaim = async (req, res, next) => {
   try {
     const { reason } = req.body;
     const claim = await Claim.findById(req.params.id);
-    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+  if (!claim) return res.status(404).json({ success:false, error: 'Claim not found' });
     if (claim.status !== 'approved') {
-      return res.status(400).json({ message: 'Only approved claims can be rejected by finance' });
+  return res.status(400).json({ success:false, error: 'Only approved claims can be rejected by finance' });
     }
-    claim.transitionTo('rejected');
+  if (claim.countedInUsage) { await decrementUsed(claim.user, claim.amount); claim.countedInUsage = false; }
+  claim.transitionTo('rejected');
     claim.financeReviewer = req.user._id;
     claim.rejectionReason = reason || '';
     await claim.save();
-    return res.json({ claim });
+  return res.json(success({ claim }));
   } catch (err) {
     return next(err);
   }
@@ -261,34 +278,25 @@ exports.financeRejectClaim = async (req, res, next) => {
 // Manager list submitted claims (filter + pagination)
 exports.listSubmitted = async (req, res, next) => {
   try {
-    const { page = 1, limit = 10, status } = req.query;
-    const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
-    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
+    const { page=1, limit=10, status, sortBy, sortDir } = req.query;
     const allowedStatuses = ["submitted", "approved", "rejected"]; 
-    const query = { status: status && allowedStatuses.includes(status) ? status : 'submitted' };
-    if (req.user.role === 'manager') {
-      query.manager = req.user._id; // use snapshot index
-    } else if (req.user.role === 'admin') {
-      // Admin sees all submitted by default
-    }
-    const [items, total] = await Promise.all([
-      Claim.find(query)
-        .sort({ createdAt: -1 })
-        .skip((parsedPage - 1) * parsedLimit)
-        .limit(parsedLimit)
-        // Provide creator basic identity (name, role) so reviewing manager can display submitter
-        .populate('user', 'name role'),
-      Claim.countDocuments(query),
-    ]);
-    // Normalize: expose a consistent "employee" field (even if creator is a manager) for UI labels
-    const claims = items.map(doc => {
+    const statusFilter = status && allowedStatuses.includes(status) ? status : 'submitted';
+    const query = { status: statusFilter };
+    if (req.user.role === 'manager') query.manager = req.user._id;
+    let sortField = 'submittedAt';
+    if (['submittedAt','amount','approvedAt'].includes(sortBy)) sortField = sortBy;
+    const direction = sortDir === 'asc' ? 'asc' : 'desc';
+    const response = await paginate(
+      Claim.find(query).populate('user','name role'),
+      () => Claim.countDocuments(query),
+      { page, limit, sortBy: sortField, sortDir: direction, status: statusFilter }
+    );
+    response.data.items = response.data.items.map(doc => {
       const o = doc.toObject({ getters: true });
-      if (doc.user) {
-        o.employee = { _id: doc.user._id, name: doc.user.name, role: doc.user.role };
-      }
+      if (doc.user) o.employee = { _id: doc.user._id, name: doc.user.name, role: doc.user.role };
       return o;
     });
-    return res.json({ page: parsedPage, limit: parsedLimit, total, claims });
+    return res.json(response);
   } catch (err) {
     return next(err);
   }
@@ -297,23 +305,18 @@ exports.listSubmitted = async (req, res, next) => {
 // Finance list approved claims (optionally reimbursed) with pagination
 exports.listForFinance = async (req, res, next) => {
   try {
-    const { page = 1, limit = 10, status } = req.query;
-    const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
-    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
-    const allowedStatuses = ["approved", "reimbursed"]; // finance cares about these
-    let queryStatus = "approved";
-    if (status) {
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({ message: "Invalid status filter" });
-      }
-      queryStatus = status;
-    }
-    const query = { status: queryStatus };
-    const [items, total] = await Promise.all([
-      Claim.find(query).sort({ createdAt: -1 }).skip((parsedPage - 1) * parsedLimit).limit(parsedLimit),
-      Claim.countDocuments(query),
-    ]);
-    return res.json({ page: parsedPage, limit: parsedLimit, total, claims: items });
+    const { page=1, limit=10, status, sortBy, sortDir } = req.query;
+    const allowedStatuses = ["approved", "reimbursed"]; 
+    const statusFilter = status && allowedStatuses.includes(status) ? status : 'approved';
+    let sortField = 'approvedAt';
+    if (['approvedAt','amount','submittedAt'].includes(sortBy)) sortField = sortBy;
+    const direction = sortDir === 'asc' ? 'asc' : 'desc';
+    const response = await paginate(
+      Claim.find({ status: statusFilter }),
+      () => Claim.countDocuments({ status: statusFilter }),
+      { page, limit, sortBy: sortField, sortDir: direction, status: statusFilter }
+    );
+    return res.json(response);
   } catch (err) {
     return next(err);
   }
@@ -326,21 +329,21 @@ exports.updateDraftClaim = async (req, res, next) => {
     const { id } = req.params;
     const { title, amount, description } = req.body;
     const claim = await Claim.findById(id);
-    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+  if (!claim) return res.status(404).json({ success:false, error: 'Claim not found' });
     if (claim.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not your claim' });
+  return res.status(403).json({ success:false, error: 'Not your claim' });
     }
     if (claim.status !== 'draft') {
-      return res.status(400).json({ message: 'Only draft claims can be edited' });
+  return res.status(400).json({ success:false, error: 'Only draft claims can be edited' });
     }
     if (title !== undefined) {
-      if (!title) return res.status(400).json({ message: 'Title cannot be empty' });
+  if (!title) return res.status(400).json({ success:false, error: 'Title cannot be empty' });
       claim.title = title;
     }
     if (description !== undefined) claim.description = description;
     if (amount !== undefined) {
       const numericAmount = Number(amount);
-      if (!(numericAmount > 0)) return res.status(400).json({ message: 'Amount must be greater than 0' });
+  if (!(numericAmount > 0)) return res.status(400).json({ success:false, error: 'Amount must be greater than 0' });
       claim.amount = numericAmount;
     }
     if (req.file) {
@@ -363,22 +366,22 @@ exports.updateDraftClaim = async (req, res, next) => {
       } else {
         const { Types } = require('mongoose');
         if (!Types.ObjectId.isValid(provided)) {
-          return res.status(400).json({ message: 'Invalid manager id supplied' });
+          return res.status(400).json({ success:false, error: 'Invalid manager id supplied' });
         }
         if (provided.toString() === req.user._id.toString()) {
-          return res.status(400).json({ message: 'Cannot assign yourself as reviewing manager' });
+          return res.status(400).json({ success:false, error: 'Cannot assign yourself as reviewing manager' });
         }
         const { User } = require('../models');
         const mgrUser = await User.findById(provided).select('role isActive');
         if (!mgrUser || !mgrUser.isActive || mgrUser.role !== 'manager') {
-          return res.status(400).json({ message: 'Provided reviewer must be an active manager' });
+          return res.status(400).json({ success:false, error: 'Provided reviewer must be an active manager' });
         }
         claim.manager = mgrUser._id;
       }
     }
     await claim.save();
     const effectiveClaimLimit = await Config.getEffectiveClaimLimit(req.user);
-    return res.json({ claim, effectiveClaimLimit });
+  return res.json(success({ claim, effectiveClaimLimit }));
   } catch (err) {
     return next(err);
   }
@@ -390,12 +393,12 @@ exports.deleteDraftClaim = async (req, res, next) => {
   try {
     const { id } = req.params;
     const claim = await Claim.findById(id);
-    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+  if (!claim) return res.status(404).json({ success:false, error: 'Claim not found' });
     if (claim.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not your claim' });
+  return res.status(403).json({ success:false, error: 'Not your claim' });
     }
     if (claim.status !== 'draft') {
-      return res.status(400).json({ message: 'Only draft claims can be deleted' });
+  return res.status(400).json({ success:false, error: 'Only draft claims can be deleted' });
     }
     // Attempt to delete receipt & attachments from disk (best effort)
     const paths = [];
@@ -409,7 +412,7 @@ exports.deleteDraftClaim = async (req, res, next) => {
       fs.promises.unlink(p).catch(()=>{}); // ignore errors
     }
     await claim.deleteOne();
-    return res.status(204).end();
+  return res.status(200).json(success({ deleted: true }));
   } catch (err) {
     return next(err);
   }
@@ -421,21 +424,21 @@ exports.getClaimManager = async (req, res, next) => {
   try {
     const { id } = req.params;
     const claim = await Claim.findById(id).select('user manager');
-    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+  if (!claim) return res.status(404).json({ success:false, error: 'Claim not found' });
     const requester = req.user;
     const isOwner = claim.user.toString() === requester._id.toString();
     const isClaimManager = claim.manager && claim.manager.toString() === requester._id.toString();
     const elevated = ['admin','finance'].includes(requester.role);
     if (!(isOwner || isClaimManager || elevated)) {
-      return res.status(403).json({ message: 'Not authorized to view manager for this claim' });
+  return res.status(403).json({ success:false, error: 'Not authorized to view manager for this claim' });
     }
     if (!claim.manager) {
-      return res.status(404).json({ message: 'No manager associated with this claim' });
+  return res.status(404).json({ success:false, error: 'No manager associated with this claim' });
     }
     const { User } = require('../models');
     const manager = await User.findById(claim.manager).select('name email role');
-    if (!manager) return res.status(404).json({ message: 'Manager not found' });
-    return res.json({ manager });
+  if (!manager) return res.status(404).json({ success:false, error: 'Manager not found' });
+  return res.json(success({ manager }));
   } catch (err) {
     return next(err);
   }
@@ -448,16 +451,16 @@ exports.getClaim = async (req, res, next) => {
     const { id } = req.params;
     const { Types } = require('mongoose');
     if (!Types.ObjectId.isValid(id)) {
-      return res.status(404).json({ message: 'Claim not found' });
+  return res.status(404).json({ success:false, error: 'Claim not found' });
     }
     const claim = await Claim.findById(id);
-    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+  if (!claim) return res.status(404).json({ success:false, error: 'Claim not found' });
     const requester = req.user;
     const isOwner = claim.user.toString() === requester._id.toString();
     const isAssignedManager = claim.manager && claim.manager.toString() === requester._id.toString();
     const elevated = ['admin','finance'].includes(requester.role);
     if (!(isOwner || isAssignedManager || elevated)) {
-      return res.status(403).json({ message: 'Not authorized to view this claim' });
+  return res.status(403).json({ success:false, error: 'Not authorized to view this claim' });
     }
     const { User } = require('../models');
     const creator = await User.findById(claim.user).select('name email role');
@@ -466,11 +469,7 @@ exports.getClaim = async (req, res, next) => {
       assignedManager = await User.findById(claim.manager).select('name email role');
     }
     // Provide a minimal, stable shape for frontend
-    return res.json({
-      claim,
-      creator,
-      assignedManager
-    });
+  return res.json(success({ claim, creator, assignedManager }));
   } catch (err) {
     return next(err);
   }

@@ -29,8 +29,11 @@ function fileFilter(_req, file, cb) {
 
 const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
-// Create draft claim (employee, manager, admin)
+// Create draft or submit claim (employee, manager, admin) with optional submit flag
 router.post("/", protect, authorize("employee", "manager", "admin"), upload.single("receipt"), claimController.createClaim);
+
+// Update (draft) and optionally submit via submit flag (PUT) or patch for partial updates
+router.put('/:id', protect, authorize('employee','manager','admin'), upload.single('receipt'), claimController.updateDraftClaim);
 
 // Update existing draft claim (owner: employee, manager, admin)
 router.patch('/:id', protect, authorize('employee','manager','admin'), upload.single('receipt'), claimController.updateDraftClaim);
@@ -50,8 +53,9 @@ router.put("/:id/approve", protect, authorize("manager","admin"), claimControlle
 router.put("/:id/reject", protect, authorize("manager","admin"), claimController.rejectClaim);
 // Claim manager lookup
 router.get('/:id/manager', protect, authorize('employee','manager','finance','admin'), claimController.getClaimManager);
-// Manager list submitted/approved/rejected (filtered)
-router.get("/manager", protect, authorize("manager"), claimController.listSubmitted);
+// Manager/team list (alias old /manager retained)
+router.get("/team", protect, authorize("manager","admin"), claimController.listSubmitted);
+router.get("/manager", protect, authorize("manager"), claimController.listSubmitted); // backward compatibility
 
 // Finance reimburse (finance or admin)
 router.put("/:id/reimburse", protect, authorize("finance","admin"), claimController.reimburseClaim);

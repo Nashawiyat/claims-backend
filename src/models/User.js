@@ -42,6 +42,11 @@ const UserSchema = new mongoose.Schema(
       default: null,
       min: 0,
     },
+  // Persisted tracking of used claim amount (updated on transitions) for fast queries
+  usedClaimAmount: { type: Number, default: 0, min: 0 },
+  // Unified total limit (resolved from override/global) cached for reporting (optional periodic recompute)
+  claimLimitTotal: { type: Number, default: 0, min: 0 },
+  lastClaimResetAt: { type: Date },
     isActive: { type: Boolean, default: true, index: true },
     lastLoginAt: { type: Date },
   },
@@ -73,10 +78,15 @@ UserSchema.pre("save", async function (next) {
   }
 });
 
-// When role changes from employee to something else, manager can be cleared automatically (optional logic)
+// When role changes, only clear manager if new role no longer participates in supervision chain.
+// Previously we cleared for any non-employee role which removed supervising manager from managers
+// themselves, breaking ability to snapshot their reviewer on claim creation.
 UserSchema.pre("save", function (next) {
-  if (this.isModified("role") && this.role !== "employee" && this.manager) {
-    this.manager = undefined;
+  if (this.isModified("role")) {
+    // Allow both employees and managers to retain a supervising manager reference
+    if (!["employee", "manager"].includes(this.role) && this.manager) {
+      this.manager = undefined; // finance/admin do not keep manager link
+    }
   }
   next();
 });
